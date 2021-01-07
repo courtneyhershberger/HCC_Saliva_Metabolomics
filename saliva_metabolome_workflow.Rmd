@@ -1,0 +1,440 @@
+---
+title: "Saliva Metabolome Workflow"
+author: "Courtney Hershberger"
+date: "6/26/2020"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = F)
+```
+
+*RMarkdown files use their location as the path*
+```{r}
+set.seed(42)
+getwd()
+```
+
+```{r message=FALSE}
+library(Hmisc)
+library(ggplot2)
+library(tidyr)
+library(ggfortify)
+library(ggsci)
+library(FactoMineR)
+library(factoextra)
+library(matrixStats)
+library(ggpubr)
+library(rstatix)
+library(randomForest)
+library(ROCR)
+library(formattable)
+library(DT)
+library(forestplot)
+library(rtf)
+library(rpart)
+library(party)
+library(ggrepel)
+library("ggpattern")
+library(rpart.plot)
+library(rattle)
+library(rpart.utils)
+library(plyr)
+library(dplyr)
+
+```
+
+##My functions
+```{r}
+source("../functions/colors.r")
+source("../functions/replace_ids.R")
+```
+
+## Data Wrangling
+### Read in data  
+
+*Note: this process automatically selects the first sheet in the excel files*  
+We are working with saliva pre-treatment because that column is consistently "checked" therefore we should use age of saliva collection pre-treatment.  
+Data comes from EHR and RedCAP
+```{r}
+#metabolite data
+data.dir <- file.path("data")
+data.files <- list.files(data.dir)
+data.name <- data.files[grep("submit.xlsx", data.files)]
+readin <- function(x){
+  data <- readxl::read_xlsx(file.path(data.dir, x))
+  return(data)
+}
+
+data <- lapply(data.name, readin)
+
+#covariate data
+unblind1 <- readxl::read_xlsx("data/rotroff_HCC_WCMC_sample_list_2019_UNBLINDED.xlsx")
+unblind2 <- readxl::read_xlsx("data/WCMC_cirrhosis_samples_3_9.xlsx")
+
+covar1 <- readxl::read_xlsx("data/EHR_saliva_HCC_healthy.xlsx", na="NA")
+covar2 <- readxl::read_xlsx("data/10347RegistryLiverTu_DATA_LABELS_2020-07-02_2047_PHI_SAFE.xlsx", na="NA")
+covar3 <- readxl::read_xlsx("data/redcapdata.xlsx", na="NA")
+
+clinical_features <- readxl::read_xlsx("data/clinical_features.xlsx", sheet=2, na="NA")
+
+```
+
+
+
+### Preprocessing
+The first script collapses redcap and EHR data into a single file providing each label with an mrn with an age and sex, output is stored in processed_data folder. This is also used to deduplicate (some mrns were run twice and have different labels). The second script takes the two saliva metabolome input files and creates three processed files in saliva_metabolome/processed_data/: column metadata, the row metadata and the data from both inputs.  
+*Note: the two inputs had different column metadata and only those that were common to the two inputs was retained. Additionally, different metabolites were represented in the two inputs, but all metabolites were kept, generating NAs.*  
+Note: there are duplicate individuals (same mrn different label, run twice either within the same batch or between batches)
+
+If a compound is identified, it has a name, and external database identifiers such as InChI key, PubChem ID and KEGG ID. Unidentified compounds were removed.
+
+Clinical variables for table 1: if value was listed as <0.2 it was imputed as half of the value, ==0.1
+
+```{r}
+source("scripts/metadata_processing.R")
+source("scripts/data_preprocessing.R")
+```
+## QC
+
+### Distribution and Transformation of Relative Abundance
+We assessed the distribution of relative abundance for each metabolites within this dataset. Relative abundance is skewed but after log transformation, it is normally distributed. From this point, proc.data is log transformed. 
+
+```{r fig.height=30, fig.width=8}
+source("scripts/transformation.R")
+
+```
+
+### PCA  
+```{r fig.height=6, fig.width=8}
+pca.data <- proc.data.log
+source("scripts/PCA.R")
+pca_plot1 <- p
+
+```
+
+### Scaling within each metabolite  
+```{r}
+#split into batches and transpose
+proc.data.log.1 <- proc.data.log[which(rownames(proc.data.log) %in% col.meta.data[which(col.meta.data$batch==1),"label"]),]
+proc.data.log.2 <- proc.data.log[which(rownames(proc.data.log) %in% col.meta.data[which(col.meta.data$batch==2),"label"]),]
+
+proc.data.log.1 <- scale(proc.data.log.1, center=T, scale=T)
+proc.data.log.2 <- scale(proc.data.log.2, center=T, scale=T)
+
+proc.data.log.scaled <- data.frame(rbind(proc.data.log.1, proc.data.log.2))
+
+```
+
+### Better PCA  
+```{r fig.height=6, fig.width=8}
+pca.data <- proc.data.log.scaled
+source("scripts/PCA.R")
+pca_plot2 <- p
+```
+
+### Removal of duplicates & incomplete cases
+duplicates were used to assess quality of the mass spec analysis as well as control for batch effects. They will now be averaged.  I am changing the rownames from this point forward from label to mrn.  Labels will be stored in the all.meta dataframe. I will also remove the HCC individual who has no metadata. 
+```{r}
+proc.data.log.scaled <- merge(proc.data.log.scaled, all.meta[,c("label","mrn")],by.x="row.names",by.y="label")
+proc.data.log.scaled$Row.names <- NULL
+
+detach(package:plyr)
+all.meta <- all.meta %>% 
+    group_by(mrn) %>% 
+    summarise(label = paste(unique(label), collapse = '_'),
+    sex=paste(unique(sex), collapse = '_'),
+    age_days=paste(unique(age_days), collapse = '_'),
+    diagnosis=paste(unique(diagnosis), collapse = '_'),
+    smoker=paste(unique(smoker), collapse = '_'))
+all.meta <- data.frame(all.meta)
+all.meta$age_days <- as.numeric(all.meta$age_days)
+all.meta <- all.meta[complete.cases(all.meta),]
+
+proc.data.log.scaled <- proc.data.log.scaled %>%
+  group_by(mrn) %>%
+  summarise_all("mean")
+
+proc.data.log.scaled <- data.frame(proc.data.log.scaled)
+rownames(proc.data.log.scaled) <- proc.data.log.scaled$mrn
+proc.data.log.scaled$mrn <- NULL
+proc.data.log.scaled <- proc.data.log.scaled[which(rownames(proc.data.log.scaled) %in% all.meta$mrn),]
+
+proc.data.log.scaled <- proc.data.log.scaled[rownames(proc.data.log.scaled) %in% all.meta[which(all.meta$diagnosis %in% c("Healthy","Cirrhosis","HCC")),"mrn"],]
+
+```      
+
+## Association of Covariates & Metabolites
+```{r}
+source("scripts/covariate_associations.R")
+
+df <- proc.data.log.scaled
+source("scripts/metabolite_associations.R")
+```
+
+#removal of 10% of each group as testing cohort
+```{r}
+mrn1 <- all.meta[which(all.meta$diagnosis=="HCC"),][sample(nrow(all.meta[which(all.meta$diagnosis=="HCC"),]), 4), "mrn"]
+mrn2 <- all.meta[which(all.meta$diagnosis=="Healthy"),][sample(nrow(all.meta[which(all.meta$diagnosis=="Healthy"),]), 4), "mrn"]
+mrn3 <- all.meta[which(all.meta$diagnosis=="Cirrhosis"),][sample(nrow(all.meta[which(all.meta$diagnosis=="Cirrhosis"),]), 3), "mrn"]
+
+mrn_remove <- c(mrn1, mrn2, mrn3)
+
+test <- proc.data.log.scaled[rownames(proc.data.log.scaled) %in% mrn_remove,]
+proc.data.log.scaled <- proc.data.log.scaled[!rownames(proc.data.log.scaled) %in% mrn_remove,]
+```
+
+## Random Forest  
+
+### Selecting parameters for random forest
+```{r}
+df <- proc.data.log.scaled
+source("scripts/rf_parameter_selection.R")
+
+```
+Conclusion: 100 trees
+
+### Summary values for LVOO
+```{r}
+myntree <- 150
+
+#Leave one out 
+#as.datatable(formattable(data.frame(summary_list[[3]])))
+random_forest_metrics <- data.frame(t(summary_list[[3]]))
+```
+
+### LVOO Gini Scores
+```{r}
+source("scripts/rf_LVOO_gini_scores.R")
+#as.datatable(formattable(data.frame(gini.sum, row.names = NULL)))
+LOOCV.gini.sum <- gini.sum
+```
+
+## Selecting Gini scores
+Drop the metabolite with the lowest Gini score and record OOB error. When the error starts rising, we have identified the correct number of metabolites to use in the model. 
+**Note: when there are fewer than 6 metabolites left as variables for the random forest, mtry is automatically reset by the random forest function**
+```{r}
+source("scripts/rf_metabolite_selection.R")
+
+source("scripts/rf_4variables.R")
+final_rf_accuracy_metrics <- data.frame(t(final_rf_accuracy_metrics))
+
+source("scripts/rf_12variables.R")
+rf12_accuracy_metrics <- data.frame(t(rf12_accuracy_metrics))
+```
+
+
+
+#Decision tree
+```{r}
+source("scripts/decision_tree_rpart.R")
+
+#accuracy metrics 
+data.frame(summary)
+decision_tree_metrics <- data.frame(t(summary))
+
+source("scripts/decision_tree_graphic2.R")
+
+```
+
+### Metabolite covariate concerns
+```{r}
+
+#which metabolite? metabolite_16
+met16 <- proc.data.log.scaled[,"metabolite_16",drop=F]
+met16 <- merge(met16, all.meta, by.x="row.names", by.y="mrn")
+met16 <- met16[which(met16$diagnosis %in% c("Cirrhosis","HCC")),]
+met16$outcome <- ifelse(met16$diagnosis == "HCC", 1, 0)
+
+fit <- glm(met16[,"outcome"]~met16[,"metabolite_16"], family = "binomial")
+summary(fit)
+
+fit <- glm(met16[,"outcome"]~met16[,"sex"], family = "binomial")
+summary(fit)
+
+fit <- glm(met16[,"outcome"]~met16[,"sex"]+met16[,"metabolite_16"], family = "binomial")
+summary(fit)
+
+#is met16 associated with sex? No!
+met16 <- proc.data.log.scaled[,"metabolite_16",drop=F]
+met16 <- merge(met16, all.meta, by.x="row.names", by.y="mrn")
+met16$outcome <- ifelse(met16$sex == "Male", 1, 0)
+fit <- glm(met16[,"outcome"]~met16[,"metabolite_16"], family = "binomial")
+model <- summary(fit)
+p.value <- model$coefficients[2,4]
+beta <- round(model$coefficients[2,1], digits=3)
+std.err <- round(model$coefficients[2,2], digits=3)
+
+#boxplot
+sex_boxplot <- ggplot(data=met16, aes(y=metabolite_16, x=sex, color=sex))+
+  geom_boxplot() +
+  geom_boxplot(color=c("red","blue")) +
+  theme_classic() +
+  labs(y=met_key[which(met_key$ID %in% "metabolite_16"),"metabolite_name"], x="Sex") +
+  theme(legend.position = "none")
+
+
+
+#rerun random forest without metabolite 16 and check accuracy.
+source("scripts/rf_removemet16.R")
+
+```
+
+#Is acetophenone associated with smoking?
+```{r}
+#is met20 associated with smoking? 
+met20 <- proc.data.log.scaled[,"metabolite_20",drop=F]
+met20 <- merge(met20, all.meta, by.x="row.names", by.y="mrn")
+met20$outcome <- ifelse(met20$smoker == "Yes", 1, 0)
+fit <- glm(met20[,"outcome"]~met20[,"metabolite_20"], family = "binomial")
+model <- summary(fit)
+p.value <- model$coefficients[2,4]
+beta <- round(model$coefficients[2,1], digits=3)
+std.err <- round(model$coefficients[2,2], digits=3)
+
+#boxplot
+smoker_boxplot <- ggplot(data=met20, aes(y=metabolite_20, x=smoker, color=smoker))+
+  geom_boxplot() +
+  theme_classic() +
+  labs(y=met_key[which(met_key$ID %in% "metabolite_20"),"metabolite_name"], x="Smoking_Status") +
+  theme(legend.position = "none")
+
+```
+
+
+## Manuscript Preparation
+### Export Tables (if not working, make sure document isn't open)
+```{r}
+source("scripts/makingtables.R")
+
+```
+
+### Export Figures
+```{r}
+source("scripts/accuracy_metrics_figure.R")
+
+pdf("figures/metabolites_boxplots.pdf", height = 8, width = 14)
+print(ggarrange(plotlist=metabolite_boxplot_list, 
+          ncol = 4, nrow = 2))
+dev.off()
+
+pdf("figures/random_forest_gridsearch.pdf", height = 9.5, width = 3.6)
+print(accuracy_metrics_plot)
+dev.off()
+
+pdf("figures/gini_plot1.pdf", height = 4, width = 2, bg = "transparent")
+print(giniplot_1)
+dev.off()
+
+pdf("figures/gini_plot2.pdf", height = 2.7, width = 3.5)
+print(giniplot_2)
+dev.off()
+
+pdf("figures/gini_plot3.pdf", height = 1.7, width = 3.5)
+print(giniplot_3)
+dev.off()
+
+pdf("figures/drop_metabolites_rf.pdf", height = 2, width = 2.8)
+print(drop_metabolites)
+dev.off()
+
+pdf("figures/volcanos.pdf", height = 4, width = 10)
+print(volcanos)
+dev.off()
+
+pdf("figures/pca_plots.pdf", height = 10, width = 7)
+print(ggarrange(pca_plot1, pca_plot2, 
+          ncol = 1, nrow = 2))
+dev.off()
+
+
+print(ggarrange(plotlist=accuracy_metrics_plotlist, 
+          ncol = 1, nrow = 4))
+ggsave("figures/accuracy_metrics.pdf", height=8.5, width=3.7)
+
+
+print(ggarrange(plotlist=leafbarplots, 
+          ncol = 6, nrow = 1, common.legend = TRUE, legend="bottom"))
+ggsave("figures/leafbarplots.pdf", height=1.5, width=8)
+
+no_16_accuracy_barplot
+ggsave("figures/accuracy_barplot_no4hydroxy.pdf", height=9, width=4)
+
+sex_boxplot
+ggsave("figures/sex_boxplot.pdf", height=2, width=2)
+```
+#OOB for training and test cohorts
+```{r}
+#iRF125
+df <- proc.data.log.scaled
+df$mrn <- rownames(df)
+df <- merge(df, all.meta[,c("mrn","diagnosis")], by="mrn")
+df$mrn <- NULL
+df <- df[which(df$diagnosis %in% c("Healthy","Cirrhosis","HCC")),]
+df$diagnosis <- factor(df$diagnosis, levels = c("Healthy", "Cirrhosis", "HCC"))
+
+irf125 <- randomForest(diagnosis ~ ., data=df, ntree=myntree, importance=TRUE)
+print(irf125)
+
+classification_err <- function(model, all.meta, test){
+  df <- data.frame(pred=predict(model, test, type="class"))
+  df$mrn <- rownames(df)
+  df <- merge(df, all.meta[,c("mrn","diagnosis")], by="mrn")
+  df$mrn <- NULL
+  df$diagnosis <- factor(df$diagnosis, levels = c("Healthy", "Cirrhosis", "HCC"))
+  df$pred <- factor(df$pred, levels = c("Healthy", "Cirrhosis", "HCC"))
+  print(table(df$pred, df$diagnosis))
+}
+classification_err(model=irf125, all.meta=all.meta, test=test)
+
+
+#iRF12
+best_met <- oob[114,"metabolites"]
+best_met <- unlist(strsplit(best_met, ","))
+best_met <- c(best_met, "diagnosis")
+best_met_form <- paste(best_met, sep=' + ', collapse=" + ")
+df <- df[,colnames(df) %in% best_met]
+irf12 <- randomForest(diagnosis ~ ., data=df, ntree=myntree, importance=TRUE)
+print(irf12)
+
+classification_err(model=irf12, all.meta=all.meta, test=test)
+
+#Decision Tree
+DT <- rpart(as.formula(paste("diagnosis ~", best_met_form)), 
+             method="class",
+             data=df)
+classification_err(model=DT, all.meta=all.meta, test=test)
+
+
+#iRF4
+best_met <- oob[122,"metabolites"]
+best_met <- unlist(strsplit(best_met, ","))
+best_met <- c(best_met, "diagnosis")
+best_met_form <- paste(best_met, sep=' + ', collapse=" + ")
+df <- df[,colnames(df) %in% best_met]
+irf4 <- randomForest(diagnosis ~ ., data=df, ntree=myntree, importance=TRUE)
+print(irf4)
+
+classification_err(model=irf4, all.meta=all.meta, test=test)
+
+#Decision Tree
+DT <- rpart(as.formula(paste("diagnosis ~", best_met_form)), 
+             method="class",
+             data=df)
+classification_err(model=DT, all.meta=all.meta, test=test)
+```
+
+#Extra
+```{r}
+#creatinine correlations
+source("scripts/creatinine_correlation.R")
+
+```
+
+
+
+
+
